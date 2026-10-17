@@ -9,7 +9,7 @@ from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
 
 from . import config
-from .guards import CareGuards
+from .guards import CareGuards, base_name
 from .prompts import SYSTEM_PROMPT
 from .verifier import Evidence
 
@@ -23,8 +23,14 @@ FALLBACK = {
 }
 
 
-def mcp_clients(headers: dict | None = None) -> list[MCPClient]:
-    return [MCPClient(lambda url=url: streamablehttp_client(url, headers=headers or {}))
+def mcp_clients() -> list[MCPClient]:
+    """Billing MCP (Java) and care tools (Gateway on AWS, local MCP server in development)."""
+    auth = None
+    if config.MCP_AUTH == "sigv4":
+        from .sigv4 import AgentCoreSigV4
+
+        auth = AgentCoreSigV4(config.REGION)
+    return [MCPClient(lambda url=url: streamablehttp_client(url, auth=auth, timeout=60))
             for url in (config.BILLING_MCP_URL, config.CARE_MCP_URL)]
 
 
@@ -35,6 +41,7 @@ class TurnResult:
     retries: int
     unsupported: list = field(default_factory=list)
     blocked: list = field(default_factory=list)
+    tool_calls: list = field(default_factory=list)
 
 
 class CareSession:
@@ -55,6 +62,7 @@ class CareSession:
 
     def ask(self, message: str) -> TurnResult:
         self.guards.blocked.clear()
+        start = len(self.agent.messages)
         text = str(self.agent(message)).strip()
         retries = 0
         bad = self.evidence.unsupported(text)
@@ -62,11 +70,22 @@ class CareSession:
             retries += 1
             log.warning("verifier rejected amounts %s", bad)
             text = str(self.agent(
-                "[VERIFIER — not from the customer] Your previous answer mentions amounts that do not appear "
-                f"in any tool result or use the wrong currency: {', '.join(bad)}. Check the tools again and rewrite "
-                "the answer for the customer using only traceable amounts in US dollars ($).")).strip()
+                "[VERIFIER — internal, the customer cannot see this message] Your previous answer mentions "
+                f"amounts that do not appear in any tool result or use the wrong currency: {', '.join(bad)}. "
+                "Write the answer again from scratch, in US dollars and only with amounts returned by tools. "
+                "If you need to refer to an amount the customer asked for, do it without the number. Output "
+                "only the new customer-facing answer; do not apologize for or mention any correction.")).strip()
             bad = self.evidence.unsupported(text)
+        calls = executed_tool_calls(self.agent.messages[start:])
         if bad:
             return TurnResult(FALLBACK.get(self.language, FALLBACK["es"]), False, retries, bad,
-                              list(self.guards.blocked))
-        return TurnResult(text, True, retries, [], list(self.guards.blocked))
+                              list(self.guards.blocked), calls)
+        return TurnResult(text, True, retries, [], list(self.guards.blocked), calls)
+
+
+def executed_tool_calls(messages: list) -> list[dict]:
+    """Tool calls that actually ran (guard-cancelled calls come back as error results)."""
+    ok = {c["toolResult"]["toolUseId"] for m in messages for c in m["content"]
+          if "toolResult" in c and c["toolResult"].get("status") != "error"}
+    return [{"name": base_name(c["toolUse"]["name"]), "input": c["toolUse"].get("input") or {}}
+            for m in messages for c in m["content"] if "toolUse" in c and c["toolUse"]["toolUseId"] in ok]

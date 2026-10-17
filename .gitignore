@@ -3,7 +3,7 @@ __pycache__/
 .pytest_cache/
 mcp-billing-java/target/
 data/out/
-evals/results.json
+evals/results*.json
 infra/.terraform/
 infra/*.tfstate*
 infra/.terraform.lock.hcl

@@ -1,0 +1,6 @@
+strands-agents==1.61.1
+bedrock-agentcore[strands-agents]==1.24.1
+mcp==1.30.0
+boto3
+httpx
+aws-opentelemetry-distro

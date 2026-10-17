@@ -1,7 +1,8 @@
-"""Runs the scenario suite against the agent and writes evals/report.md + evals/results.json.
+"""Runs the scenario suite and writes evals/report.md + evals/results.json.
 
-    python evals/run_evals.py            # all scenarios
+    python evals/run_evals.py                    # local agent (MCP servers on :8000 / :8001)
     python evals/run_evals.py zone-outage
+    python evals/run_evals.py --remote           # deployed agent on AgentCore Runtime
 """
 
 import json
@@ -14,29 +15,9 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 
 from conecta_agent.agent import CareSession, mcp_clients  # noqa: E402
-from conecta_agent.guards import base_name  # noqa: E402
 from conecta_agent.verifier import amounts_in  # noqa: E402
 
 HERE = Path(__file__).parent
-
-
-def tool_calls(messages) -> list[dict]:
-    calls = []
-    for m in messages:
-        for c in m["content"]:
-            if "toolUse" in c:
-                calls.append({"name": base_name(c["toolUse"]["name"]), "input": c["toolUse"].get("input") or {}})
-    return calls
-
-
-def executed(messages) -> set[str]:
-    """toolUse ids whose result was not a guard cancellation."""
-    ok = set()
-    for m in messages:
-        for c in m["content"]:
-            if "toolResult" in c and c["toolResult"].get("status") != "error":
-                ok.add(c["toolResult"]["toolUseId"])
-    return ok
 
 
 def matches(args: dict, expected: dict) -> bool:
@@ -53,14 +34,8 @@ def matches(args: dict, expected: dict) -> bool:
     return True
 
 
-def check(sc, messages, final_text) -> list[str]:
+def check(sc, calls, final_text) -> list[str]:
     exp, fails = sc["expect"], []
-    done = executed(messages)
-    calls = []
-    for m in messages:
-        for c in m["content"]:
-            if "toolUse" in c and c["toolUse"]["toolUseId"] in done:
-                calls.append({"name": base_name(c["toolUse"]["name"]), "input": c["toolUse"].get("input") or {}})
     names = {c["name"] for c in calls}
     all_text = " ".join(final_text)
     for t in exp.get("tools", []):
@@ -84,7 +59,8 @@ def check(sc, messages, final_text) -> list[str]:
     for a in exp.get("amounts", []):
         if not any(abs(float(x) - a) < 0.001 for x in said):
             fails.append(f"answer lacks amount {a}")
-    for s in exp.get("not_contains", []):
+    leaks = ("corregir mi respuesta", "correct my answer", "corrijo", "VERIFIER", "verificador")
+    for s in [*exp.get("not_contains", []), *leaks]:
         if s.lower() in all_text.lower():
             fails.append(f"answer contains forbidden '{s}'")
     if exp.get("no_tool_args_for_other_customer"):
@@ -105,35 +81,96 @@ def reset_local_state():
         pass  # remote run: each scenario uses its own customer state
 
 
-def run(sc, tools) -> dict:
-    reset_local_state()
-    session = CareSession(sc["customer"], tools)
-    answers, blocked, verifier_retries, unverified = [], [], 0, 0
+class LocalTarget:
+    def __init__(self):
+        self.clients = mcp_clients()
+        for c in self.clients:
+            c.start()
+        self.tools = [t for c in self.clients for t in c.list_tools_sync()]
+
+    def new_session(self, customer_id):
+        reset_local_state()
+        session = CareSession(customer_id, self.tools)
+
+        def ask(prompt):
+            r = session.ask(prompt)
+            return {"answer": r.text, "verified": r.verified, "verifier_retries": r.retries,
+                    "guard_blocks": r.blocked, "tool_calls": r.tool_calls}
+        return ask, lambda: session.agent.event_loop_metrics.accumulated_usage
+
+    def close(self):
+        for c in self.clients:
+            c.stop(None, None, None)
+
+
+class RemoteTarget:
+    """Each scenario gets a fresh AgentCore session (its own microVM)."""
+
+    def __init__(self):
+        import subprocess
+        import boto3
+        from botocore.config import Config
+
+        self.arn = subprocess.check_output(["terraform", "-chdir=infra", "output", "-raw", "agent_runtime_arn"],
+                                           text=True, cwd=HERE.parent)
+        self.client = boto3.client("bedrock-agentcore", region_name="us-east-1",
+                                   config=Config(read_timeout=180, retries={"max_attempts": 2}))
+        self.credits = boto3.resource("dynamodb", region_name="us-east-1").Table("conecta-credits")
+
+    def reset_customer(self, customer_id):
+        """Demo environment: start each scenario without credits issued by earlier runs."""
+        from boto3.dynamodb.conditions import Key
+
+        items = self.credits.query(KeyConditionExpression=Key("customer_id").eq(customer_id))["Items"]
+        for it in items:
+            self.credits.delete_item(Key={"customer_id": customer_id, "credit_id": it["credit_id"]})
+
+    def new_session(self, customer_id):
+        import uuid
+
+        self.reset_customer(customer_id)
+        sid = f"eval-{customer_id}-{uuid.uuid4()}"
+
+        def ask(prompt):
+            r = self.client.invoke_agent_runtime(agentRuntimeArn=self.arn, runtimeSessionId=sid, qualifier="DEFAULT",
+                                                 payload=json.dumps({"customer_id": customer_id, "prompt": prompt}))
+            return json.loads(r["response"].read())
+        return ask, lambda: {}
+
+    def close(self):
+        pass
+
+
+def run(sc, target) -> dict:
+    ask, usage_of = target.new_session(sc["customer"])
+    answers, calls, blocked, verifier_retries, unverified = [], [], [], 0, 0
     t0 = time.time()
     for turn in sc["turns"]:
-        r = session.ask(turn)
-        answers.append(r.text)
-        blocked += r.blocked
-        verifier_retries += r.retries
-        unverified += 0 if r.verified else 1
+        r = ask(turn)
+        answers.append(r.get("answer", json.dumps(r)))
+        calls += r.get("tool_calls", [])
+        blocked += r.get("guard_blocks", [])
+        verifier_retries += r.get("verifier_retries", 0)
+        unverified += 0 if r.get("verified", False) else 1
     elapsed = time.time() - t0
-    usage = session.agent.event_loop_metrics.accumulated_usage
-    fails = check(sc, session.agent.messages, answers)
+    usage = usage_of()
+    fails = check(sc, calls, answers)
     return {"id": sc["id"], "customer": sc["customer"], "passed": not fails, "failures": fails,
             "turns": len(sc["turns"]), "seconds": round(elapsed, 1),
             "input_tokens": usage.get("inputTokens", 0), "output_tokens": usage.get("outputTokens", 0),
-            "tools": [c["name"] for c in tool_calls(session.agent.messages)], "guard_blocks": blocked,
+            "tools": [c["name"] for c in calls], "guard_blocks": blocked,
             "verifier_retries": verifier_retries, "unverified_answers": unverified,
             "transcript": [{"customer": q, "agent": a} for q, a in zip(sc["turns"], answers)]}
 
 
-def report(results, model_id) -> str:
+def report(results, model_id, where) -> str:
     passed = sum(r["passed"] for r in results)
     tin = sum(r["input_tokens"] for r in results)
     tout = sum(r["output_tokens"] for r in results)
     lines = [
         "# Eval report", "",
-        f"Model: `{model_id}` · scenarios: {len(results)} · **passed: {passed}/{len(results)}**", "",
+        f"Target: {where} · model: `{model_id}` · scenarios: {len(results)} · "
+        f"**passed: {passed}/{len(results)}**", "",
         f"Guard blocks: {sum(len(r['guard_blocks']) for r in results)} · verifier retries: "
         f"{sum(r['verifier_retries'] for r in results)} · unverified answers replaced: "
         f"{sum(r['unverified_answers'] for r in results)} · tokens in/out: {tin:,}/{tout:,} · "
@@ -153,28 +190,28 @@ def report(results, model_id) -> str:
     return "\n".join(lines)
 
 
-def main(only: list[str]):
+def main(args: list[str]):
     from conecta_agent import config
 
+    remote = "--remote" in args
+    only = [a for a in args if not a.startswith("--")]
     scenarios = yaml.safe_load((HERE / "scenarios.yaml").read_text())
     if only:
         scenarios = [s for s in scenarios if s["id"] in only]
-    clients = mcp_clients()
-    for c in clients:
-        c.start()
+    target = RemoteTarget() if remote else LocalTarget()
     try:
-        tools = [t for c in clients for t in c.list_tools_sync()]
         results = []
         for sc in scenarios:
-            r = run(sc, tools)
+            r = run(sc, target)
             print(f"{'PASS' if r['passed'] else 'FAIL'}  {r['id']:28s} {r['seconds']:5.1f}s  {r['failures']}")
             results.append(r)
     finally:
-        for c in clients:
-            c.stop(None, None, None)
-    (HERE / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
-    (HERE / "report.md").write_text(report(results, config.MODEL_ID))
-    print(f"\n{sum(r['passed'] for r in results)}/{len(results)} passed -> evals/report.md")
+        target.close()
+    suffix = "-remote" if remote else ""
+    where = "AgentCore Runtime (us-east-1)" if remote else "local"
+    (HERE / f"results{suffix}.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    (HERE / f"report{suffix}.md").write_text(report(results, config.MODEL_ID, where))
+    print(f"\n{sum(r['passed'] for r in results)}/{len(results)} passed -> evals/report{suffix}.md")
 
 
 if __name__ == "__main__":
