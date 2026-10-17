@@ -51,7 +51,7 @@ data "aws_iam_policy_document" "runtime_base" {
   }
   statement {
     sid       = "Traces"
-    actions   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:GetSamplingRules", "xray:GetSamplingTargets"]
+    actions   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:PutSpans", "xray:PutSpansForIndexing", "xray:GetSamplingRules", "xray:GetSamplingTargets"]
     resources = ["*"]
   }
   statement {
@@ -179,9 +179,13 @@ resource "aws_bedrockagentcore_agent_runtime" "agent" {
     MCP_AUTH        = "sigv4"
     MEMORY_ID       = aws_bedrockagentcore_memory.care.id
     # ADOT: AgentCore Observability (traces in CloudWatch GenAI Observability)
-    AGENT_OBSERVABILITY_ENABLED = "true"
-    OTEL_PYTHON_DISTRO          = "aws_distro"
-    OTEL_PYTHON_CONFIGURATOR    = "aws_configurator"
+    AGENT_OBSERVABILITY_ENABLED        = "true"
+    OTEL_PYTHON_DISTRO                 = "aws_distro"
+    OTEL_PYTHON_CONFIGURATOR           = "aws_configurator"
+    OTEL_TRACES_EXPORTER               = "otlp"
+    OTEL_EXPORTER_OTLP_PROTOCOL        = "http/protobuf"
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = "https://xray.${var.region}.amazonaws.com/v1/traces"
+    OTEL_TRACES_SAMPLER                = "always_on"
   }
   depends_on = [aws_iam_role_policy.agent_base, aws_iam_role_policy.agent_access]
 }

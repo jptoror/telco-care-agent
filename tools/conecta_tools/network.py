@@ -1,14 +1,21 @@
 """Network tools: line status, outages, remote diagnostics and modem reboot."""
 
+import time
+
 from . import data
 
-# Simulated device state changes (a reboot) live for the life of the process.
-_overrides: dict[str, dict] = {}
+# Simulated device changes (a reboot) last a few minutes, so a warm Lambda does not carry one demo
+# session's reboot into the next.
+_OVERRIDE_TTL_S = 300
+_overrides: dict[str, tuple[float, dict]] = {}
 
 
 def _device(customer_id: str) -> dict | None:
     d = data.one("devices", customer_id=customer_id)
-    return {**d, **_overrides.get(customer_id, {})} if d else None
+    if not d:
+        return None
+    ts, change = _overrides.get(customer_id, (0.0, {}))
+    return {**d, **change} if time.time() - ts < _OVERRIDE_TTL_S else d
 
 
 def _active_outages(zone_id: str) -> list[dict]:
@@ -63,7 +70,7 @@ def reboot_modem(customer_id: str) -> dict:
     if diag["diagnosis"] == "NOT_APPLICABLE":
         return {"status": "SKIPPED", "reason": "Customer has no home modem."}
     if diag["diagnosis"] == "MODEM_NEEDS_REBOOT":
-        _overrides[customer_id] = {"status": "ONLINE", "signal_dbm": "-55"}
+        _overrides[customer_id] = (time.time(), {"status": "ONLINE", "signal_dbm": "-55"})
         return {"status": "DONE", "new_status": "ONLINE", "signal_dbm": -55}
     return {"status": "DONE", "new_status": get_line_status(customer_id)["status"],
             "note": "Reboot completed but the modem state did not change."}
