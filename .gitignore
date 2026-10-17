@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+mcp-billing-java/target/
+data/out/
+evals/results.json
+infra/.terraform/
+infra/*.tfstate*
+infra/.terraform.lock.hcl
+*.zip
+.env

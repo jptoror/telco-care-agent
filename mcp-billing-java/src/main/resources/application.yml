@@ -1,0 +1,37 @@
+server:
+  port: ${PORT:8000}
+
+spring:
+  application:
+    name: mcp-billing
+  main:
+    banner-mode: off
+  ai:
+    mcp:
+      server:
+        name: conecta-billing
+        version: 0.1.0
+        type: SYNC
+        # AgentCore Runtime hosts MCP servers as stateless streamable HTTP on :8000/mcp
+        protocol: STATELESS
+        streamable-http:
+          mcp-endpoint: /mcp
+
+billing:
+  data-dir: ../data/out
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+---
+spring:
+  config:
+    activate:
+      on-profile: aws
+billing:
+  athena:
+    database: ${ATHENA_DATABASE:conecta}
+    workgroup: ${ATHENA_WORKGROUP:conecta}
+  credits-table: ${CREDITS_TABLE:conecta-credits}
