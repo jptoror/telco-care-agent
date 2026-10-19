@@ -29,6 +29,7 @@ customer ──► Agent (Strands, AgentCore Runtime, Claude on Bedrock)
 | `tools/` | Network and care tools: AgentCore Gateway Lambda handler, and a local MCP server for development. |
 | `agent/` | Strands agent, guards, grounding verifier, local CLI. |
 | `evals/` | Scripted multi-turn scenarios with deterministic checks; `report.md` (local) and `report-remote.md` (AgentCore). |
+| `docs/` | Architecture, sequence diagrams, technologies, guardrails and deployment ([index](docs/README.md)). |
 | `infra/` | Terraform (us-east-1): S3, Glue, Athena, DynamoDB, Lambdas, AgentCore Gateway, Runtimes, Memory, ECR, Transaction Search. |
 
 ## Run locally
